@@ -1,0 +1,37 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.env/
+.venv/
+env/
+venv/
+ENV/
+
+# 监控录制生成的视频文件
+*.ts
+
+# 监控录制生成的日期目录 (例如 2026-03-01)
+20[0-9][0-9]-[0-1][0-9]-[0-3][0-9]/
+
+# IDE及系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 打包文件与运行时配置
+build/
+dist/
+*.spec
+config.json
+
+# 第三方依赖大文件
+ffmpeg.exe
+*.exe
+
+# 备份与私有目录
+.git_backup
+.git_backup*/
