@@ -6,6 +6,7 @@ import threading
 import json
 import tkinter as tk
 from tkinter import messagebox, scrolledtext
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 
@@ -59,6 +60,17 @@ class MonitorApp:
         # 启动按键
         self.btn_start = tk.Button(frame_config, text="▶ 启动录制", command=self.toggle_recording, width=15, bg="green", fg="white", font=("", 10, "bold"))
         self.btn_start.grid(row=2, column=0, columnspan=2, pady=10)
+
+        # 开源与作者声明
+        frame_notice = tk.Frame(frame_config)
+        frame_notice.grid(row=3, column=0, columnspan=2, pady=(0, 5))
+        
+        lbl_notice = tk.Label(frame_notice, text="本项目基于 MIT 协议完全免费开源，项目地址：", fg="gray")
+        lbl_notice.pack(side=tk.LEFT)
+        
+        lbl_link = tk.Label(frame_notice, text="https://github.com/zhaogelz/NanoNVR", fg="blue", cursor="hand2")
+        lbl_link.pack(side=tk.LEFT)
+        lbl_link.bind("<Button-1>", lambda e: webbrowser.open_new("https://github.com/zhaogelz/NanoNVR"))
 
         # 日志输出区
         frame_log = tk.Frame(self.root, padx=10, pady=5)
