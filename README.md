@@ -1,5 +1,9 @@
 # 📹 NanoNVR — 极致轻量的护盘监控录像机
 
+
+https://github.com/user-attachments/assets/7b1013ee-f84c-44c4-ac6e-81868fe16fb0
+
+
 > **双击即用 · 深度护盘 · 专为闲置笔记本而生**
 
 NanoNVR 旨在将任何一台低成本的闲置/现役**笔记本电脑**，一键转化为稳定可靠的**局域网监控录像机（NVR）**。
