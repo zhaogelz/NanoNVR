@@ -4,8 +4,9 @@ import subprocess
 import time
 import threading
 import json
+import re
 import tkinter as tk
-from tkinter import messagebox, scrolledtext
+from tkinter import messagebox, scrolledtext, ttk, filedialog
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,7 @@ class MonitorApp:
         self.is_recording = False
         self.record_thread = None
         self.current_process = None
+        self.exporting = False
         
         self.setup_ui()
         # 使用 root.after 确保 UI 完全渲染完再填入配置
@@ -57,9 +59,15 @@ class MonitorApp:
         self.entry_max_gb.grid(row=1, column=1, sticky=tk.W, pady=5, padx=5)
         self.entry_max_gb.insert(0, "150")
 
-        # 启动按键
-        self.btn_start = tk.Button(frame_config, text="▶ 启动录制", command=self.toggle_recording, width=15, bg="green", fg="white", font=("", 10, "bold"))
-        self.btn_start.grid(row=2, column=0, columnspan=2, pady=10)
+        # 启动 / 导出按键
+        frame_btns = tk.Frame(frame_config)
+        frame_btns.grid(row=2, column=0, columnspan=2, pady=10)
+
+        self.btn_start = tk.Button(frame_btns, text="▶ 启动录制", command=self.toggle_recording, width=15, bg="green", fg="white", font=("", 10, "bold"))
+        self.btn_start.pack(side=tk.LEFT, padx=5)
+
+        self.btn_export = tk.Button(frame_btns, text="📤 导出录像", command=self.open_export_dialog, width=15, bg="#1976D2", fg="white", font=("", 10, "bold"))
+        self.btn_export.pack(side=tk.LEFT, padx=5)
 
         # 开源与作者声明
         frame_notice = tk.Frame(frame_config)
@@ -169,12 +177,31 @@ class MonitorApp:
 
     # ================= 核心录制逻辑 =================
 
-    def get_total_size_gb(self) -> float:
-        total_bytes = 0
-        for f in BASE_DIR.rglob("*.ts"):
+    def _iter_occupied_files(self):
+        """遍历所有计入配额占用的文件：日期目录下的 .ts 分片 + exports 目录下的导出 MP4"""
+        for d in BASE_DIR.iterdir():
             try:
-                if f.is_file():
-                    total_bytes += f.stat().st_size
+                if d.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.name):
+                    for f in d.glob("*.ts"):
+                        if f.is_file():
+                            yield f
+            except Exception:
+                continue
+        exports_dir = BASE_DIR / "exports"
+        if exports_dir.is_dir():
+            try:
+                for f in exports_dir.glob("*.mp4"):
+                    if f.is_file():
+                        yield f
+            except Exception:
+                pass
+
+    def get_total_size_gb(self) -> float:
+        """统计录像分片 + 导出产物的总占用（GB）"""
+        total_bytes = 0
+        for f in self._iter_occupied_files():
+            try:
+                total_bytes += f.stat().st_size
             except Exception:
                 pass
         return total_bytes / (1024 ** 3)
@@ -184,20 +211,28 @@ class MonitorApp:
         if not self.is_recording or current_gb <= max_gb:
             return
 
-        # 计算低水位目标：释放 5GB 或总配额的 10%（取较小值），确保腾出足够的连续空闲区块
-        release_gb = min(5.0, max_gb * 0.1)
+        # 计算低水位目标：释放量为配额的 10%（限制在 2~10GB 区间），
+        # 既保证腾出足够连续空闲区块，又避免小配额下释放过多导致有效录像时长过短
+        release_gb = min(max(2.0, max_gb * 0.1), 10.0)
         target_gb = max_gb - release_gb
         
         self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 存储达到爆盘水位 ({current_gb:.2f}GB / {max_gb}GB)，开始批量物理抹除至健康水位 ({target_gb:.2f}GB)...")
 
         safe_cutoff = time.time() - DELETE_SAFE_SECONDS
         files = []
-        for f in BASE_DIR.rglob("*.ts"):
+        # 只回收日期目录下的 .ts 分片，导出的 MP4 是用户主动产物，永不自动删除
+        for date_dir in BASE_DIR.iterdir():
             try:
-                if f.is_file():
-                    st = f.stat()
-                    if st.st_mtime < safe_cutoff:
-                        files.append((f, st.st_mtime, st.st_size))
+                if not (date_dir.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_dir.name)):
+                    continue
+            except Exception:
+                continue
+            try:
+                for f in date_dir.glob("*.ts"):
+                    if f.is_file():
+                        st = f.stat()
+                        if st.st_mtime < safe_cutoff:
+                            files.append((f, st.st_mtime, st.st_size))
             except Exception:
                 continue
 
@@ -233,6 +268,265 @@ class MonitorApp:
             self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 批量抹除完成：共铲除 {files_deleted_count} 个陈旧片段，释放了 {freed_gb:.2f}GB 物理空间")
         else:
             self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 存储超限，但暂无足够老旧（过了安全缓冲期）的文件可供安全移除")
+            exports_gb = self.get_exports_size_gb()
+            if exports_gb > 0:
+                self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 提示：导出目录 exports/ 已占用 {exports_gb:.2f}GB，这部分会计入配额但不会被自动清理，请手动转移或删除")
+
+    def get_exports_size_gb(self) -> float:
+        """导出目录占用（GB）"""
+        exports_dir = BASE_DIR / "exports"
+        if not exports_dir.is_dir():
+            return 0.0
+        total_bytes = 0
+        try:
+            for f in exports_dir.glob("*.mp4"):
+                if f.is_file():
+                    total_bytes += f.stat().st_size
+        except Exception:
+            pass
+        return total_bytes / (1024 ** 3)
+    # ================= 录像导出（MP4） =================
+
+    def _list_date_dirs(self):
+        """扫描所有录像日期目录（YYYY-MM-DD）"""
+        dirs = []
+        try:
+            for d in BASE_DIR.iterdir():
+                if d.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.name):
+                    dirs.append(d.name)
+        except Exception:
+            pass
+        return sorted(dirs)
+
+    def _list_segments(self, date_str):
+        """列出某天的所有分片，返回 [(Path, 'HH:MM:SS'), ...] 按时间升序"""
+        segs = []
+        day_dir = BASE_DIR / date_str
+        try:
+            for f in day_dir.glob("*.ts"):
+                m = re.fullmatch(r"(\d{2})_(\d{2})_(\d{2})\.ts", f.name)
+                if m:
+                    segs.append((f, f"{m.group(1)}:{m.group(2)}:{m.group(3)}"))
+        except Exception:
+            pass
+        segs.sort(key=lambda x: x[1])
+        return segs
+
+    def _probe_stream_codecs(self, sample: Path):
+        """用 ffmpeg -i 的输出探测视频/音频编码（无需 ffprobe）"""
+        cmd = [self._get_ffmpeg_path(), "-hide_banner", "-i", str(sample)]
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                  text=True, encoding="utf-8", errors="ignore",
+                                  creationflags=creationflags, timeout=15)
+            err = proc.stderr or ""
+        except Exception:
+            return None, None
+        v = re.search(r"Video:\s*([a-z0-9_]+)", err)
+        a = re.search(r"Audio:\s*([a-z0-9_]+)", err)
+        return (v.group(1) if v else None), (a.group(1) if a else None)
+
+    def open_export_dialog(self):
+        if self.exporting:
+            messagebox.showinfo("提示", "正在导出中，请等待当前导出完成")
+            return
+        date_dirs = self._list_date_dirs()
+        if not date_dirs:
+            messagebox.showinfo("提示", "未找到任何录像日期目录")
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("导出录像为 MP4")
+        dlg.geometry("500x340")
+        dlg.transient(self.root)
+        pad = {"padx": 10, "pady": 6}
+
+        tk.Label(dlg, text="录像日期:").grid(row=0, column=0, sticky=tk.W, **pad)
+        cb_date = ttk.Combobox(dlg, values=date_dirs, state="readonly", width=22)
+        cb_date.grid(row=0, column=1, columnspan=2, sticky=tk.W, **pad)
+        cb_date.set(date_dirs[-1])
+
+        tk.Label(dlg, text="开始分片:").grid(row=1, column=0, sticky=tk.W, **pad)
+        cb_start = ttk.Combobox(dlg, state="readonly", width=22)
+        cb_start.grid(row=1, column=1, columnspan=2, sticky=tk.W, **pad)
+
+        tk.Label(dlg, text="结束分片:").grid(row=2, column=0, sticky=tk.W, **pad)
+        cb_end = ttk.Combobox(dlg, state="readonly", width=22)
+        cb_end.grid(row=2, column=1, columnspan=2, sticky=tk.W, **pad)
+
+        tk.Label(dlg, text="（时间粒度为 15 分钟分片，结束分片会被完整包含）",
+                 fg="gray").grid(row=3, column=0, columnspan=3, sticky=tk.W, padx=10)
+
+        def refresh_times(*_):
+            times = [t for _, t in self._list_segments(cb_date.get())]
+            cb_start.config(values=times)
+            cb_end.config(values=times)
+            if times:
+                cb_start.set(times[0])
+                cb_end.set(times[-1])
+            update_default_out()
+
+        def default_out_name():
+            s = cb_start.get().replace(":", "-") or "start"
+            e = cb_end.get().replace(":", "-") or "end"
+            return f"{cb_date.get()}_{s}_{e}.mp4"
+
+        def update_default_out(*_):
+            entry_out.delete(0, tk.END)
+            entry_out.insert(0, str(BASE_DIR / "exports" / default_out_name()))
+
+        cb_date.bind("<<ComboboxSelected>>", refresh_times)
+        cb_start.bind("<<ComboboxSelected>>", update_default_out)
+        cb_end.bind("<<ComboboxSelected>>", update_default_out)
+
+        tk.Label(dlg, text="保存到:").grid(row=4, column=0, sticky=tk.W, **pad)
+        entry_out = tk.Entry(dlg, width=42)
+        entry_out.grid(row=4, column=1, sticky=tk.W, **pad)
+
+        def browse_out():
+            p = filedialog.asksaveasfilename(parent=dlg, defaultextension=".mp4",
+                                             filetypes=[("MP4 视频", "*.mp4")],
+                                             initialfile=default_out_name())
+            if p:
+                entry_out.delete(0, tk.END)
+                entry_out.insert(0, p)
+
+        tk.Button(dlg, text="浏览...", command=browse_out).grid(row=4, column=2, sticky=tk.W, padx=5)
+
+        progress = ttk.Progressbar(dlg, length=460, mode="determinate", maximum=100)
+        progress.grid(row=5, column=0, columnspan=3, padx=10, pady=(12, 2))
+        lbl_prog = tk.Label(dlg, text="待导出", fg="gray")
+        lbl_prog.grid(row=6, column=0, columnspan=3, sticky=tk.W, padx=10)
+
+        btn_do = tk.Button(dlg, text="开始导出", width=15, bg="#1976D2", fg="white",
+                           font=("", 10, "bold"))
+        btn_do.grid(row=7, column=0, columnspan=3, pady=10)
+
+        refresh_times()
+
+        def on_progress(pct, text):
+            def apply():
+                progress["value"] = pct
+                lbl_prog.config(text=text)
+            self.root.after(0, apply)
+
+        def on_done(err, out_path):
+            def apply():
+                self.exporting = False
+                btn_do.config(state=tk.NORMAL, text="开始导出")
+                if err:
+                    lbl_prog.config(text="导出失败", fg="red")
+                    messagebox.showerror("导出失败", err, parent=dlg)
+                else:
+                    progress["value"] = 100
+                    lbl_prog.config(text="导出完成", fg="green")
+                    messagebox.showinfo("导出完成", f"已导出到:\n{out_path}", parent=dlg)
+            self.root.after(0, apply)
+
+        def start_export():
+            date_str = cb_date.get()
+            start_t, end_t = cb_start.get(), cb_end.get()
+            if not start_t or not end_t:
+                messagebox.showwarning("提示", "请选择起止分片", parent=dlg)
+                return
+            if start_t > end_t:
+                messagebox.showwarning("提示", "开始分片不能晚于结束分片", parent=dlg)
+                return
+            out_path = entry_out.get().strip()
+            if not out_path:
+                messagebox.showwarning("提示", "请选择输出文件路径", parent=dlg)
+                return
+            self.exporting = True
+            btn_do.config(state=tk.DISABLED, text="导出中...")
+            progress["value"] = 0
+            lbl_prog.config(text="正在导出...", fg="gray")
+            threading.Thread(target=self._export_worker,
+                             args=(date_str, start_t, end_t, out_path, on_progress, on_done),
+                             daemon=True).start()
+
+        btn_do.config(command=start_export)
+
+    def _export_worker(self, date_str, start_t, end_t, out_path, progress_cb, done_cb):
+        """后台线程：concat 拼接分片并转封装为 MP4（视频不重新编码）"""
+        list_file = None
+        try:
+            chosen = [f for f, t in self._list_segments(date_str) if start_t <= t <= end_t]
+            if not chosen:
+                raise RuntimeError("所选时间段内没有录像分片")
+
+            vcodec, acodec = self._probe_stream_codecs(chosen[0])
+            self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 导出探测: 视频={vcodec or '未知'}, 音频={acodec or '无'}")
+
+            list_file = BASE_DIR / f"_concat_{int(time.time() * 1000)}.txt"
+            with open(list_file, "w", encoding="utf-8") as lf:
+                for f in chosen:
+                    # concat demuxer 要求转义单引号
+                    lf.write("file '" + str(f).replace("'", "'\\''") + "'\n")
+
+            total_sec = max(1, len(chosen) * SEGMENT_DURATION)
+
+            cmd = [self._get_ffmpeg_path(),
+                   "-hide_banner", "-loglevel", "error",
+                   "-f", "concat", "-safe", "0", "-i", str(list_file),
+                   "-c:v", "copy"]
+            # MP4 容器只安全放行 AAC 音频，其他编码（G.711/G.726 等）仅重编码音频，视频仍无损 copy
+            if acodec == "aac":
+                cmd += ["-c:a", "copy"]
+            elif acodec:
+                cmd += ["-c:a", "aac", "-b:a", "128k"]
+            # H.265 需要 hvc1 标签才能被 QuickTime/部分播放器识别
+            if vcodec in ("hevc", "h265"):
+                cmd += ["-tag:v", "hvc1"]
+            cmd += ["-movflags", "+faststart", "-y",
+                    "-progress", "pipe:1", "-nostats", out_path]
+
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, encoding="utf-8", errors="ignore",
+                                    creationflags=creationflags)
+
+            # 后台抽干 stderr，防止管道缓冲区写满造成死锁
+            err_buf = []
+            def drain_stderr():
+                try:
+                    err_buf.append(proc.stderr.read() or "")
+                except Exception:
+                    pass
+            drain = threading.Thread(target=drain_stderr, daemon=True)
+            drain.start()
+
+            for line in proc.stdout:
+                if line.startswith("out_time_us="):
+                    try:
+                        us = int(line.strip().split("=")[1])
+                        pct = min(99.0, us / 1_000_000 / total_sec * 100)
+                        progress_cb(pct, f"正在导出... {pct:.0f}%")
+                    except (ValueError, ZeroDivisionError):
+                        pass
+                elif line.startswith("progress=end"):
+                    break
+
+            proc.wait()
+            drain.join(timeout=3)
+
+            if proc.returncode != 0:
+                raise RuntimeError(f"ffmpeg 导出失败: {(err_buf[0] if err_buf else '').strip()[:300] or '未知错误'}")
+
+            size_mb = os.path.getsize(out_path) / (1024 ** 2)
+            self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 导出完成: {out_path} ({size_mb:.1f}MB, {len(chosen)} 个分片)")
+            progress_cb(100, "导出完成")
+            done_cb(None, out_path)
+        except Exception as e:
+            self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 导出失败: {e}")
+            done_cb(str(e), None)
+        finally:
+            if list_file:
+                try:
+                    os.remove(list_file)
+                except Exception:
+                    pass
+
     def _get_ffmpeg_path(self) -> str:
         """获取 ffmpeg 可执行文件路径"""
         if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
