@@ -5,6 +5,7 @@ import time
 import threading
 import json
 import re
+import tempfile
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk, filedialog
 import webbrowser
@@ -223,6 +224,9 @@ class MonitorApp:
     def _iter_occupied_files(self):
         """遍历所有计入配额占用的文件：日期目录下的 .ts 分片 + exports 目录下的导出 MP4"""
         save_root = self.get_save_dir()
+        # 保存目录可能位于可移动介质，中途被移除时不要让录制线程崩溃
+        if not save_root.is_dir():
+            return
         for d in save_root.iterdir():
             try:
                 if d.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.name):
@@ -506,11 +510,13 @@ class MonitorApp:
             # 确保输出目录存在（用户可能改了路径）
             Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
-            list_file = BASE_DIR / f"_concat_{int(time.time() * 1000)}.txt"
+            # 临时 concat 清单放系统临时目录，避免 exe 位于只读路径（如 Program Files）时写入失败
+            list_file = Path(tempfile.gettempdir()) / f"nanonvr_concat_{int(time.time() * 1000)}.txt"
             with open(list_file, "w", encoding="utf-8") as lf:
                 for f in chosen:
-                    # concat demuxer 要求转义单引号
-                    lf.write("file '" + str(f).replace("'", "'\\''") + "'\n")
+                    # 统一使用正斜杠路径，规避 Windows 反斜杠在 concat demuxer 中的解析歧义
+                    safe_path = str(f).replace("\\", "/")
+                    lf.write("file '" + safe_path + "'\n")
 
             total_sec = max(1, len(chosen) * SEGMENT_DURATION)
 
