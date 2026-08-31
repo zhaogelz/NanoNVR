@@ -31,13 +31,14 @@ class MonitorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("NanoNVR")
-        self.root.geometry("600x450")
-        self.root.minsize(500, 400)
+        self.root.geometry("640x480")
+        self.root.minsize(540, 440)
         
         self.is_recording = False
         self.record_thread = None
         self.current_process = None
         self.exporting = False
+        self.save_dir = BASE_DIR  # 录像与导出的保存根目录（可由用户配置，默认=程序所在目录）
         
         self.setup_ui()
         # 使用 root.after 确保 UI 完全渲染完再填入配置
@@ -59,9 +60,17 @@ class MonitorApp:
         self.entry_max_gb.grid(row=1, column=1, sticky=tk.W, pady=5, padx=5)
         self.entry_max_gb.insert(0, "150")
 
+        # 保存目录（ts 录像分片与 mp4 导出都落在此目录下，留空=程序所在目录）
+        tk.Label(frame_config, text="保存目录:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        frame_save = tk.Frame(frame_config)
+        frame_save.grid(row=2, column=1, sticky=tk.W, pady=5, padx=5)
+        self.entry_save_dir = tk.Entry(frame_save, width=44)
+        self.entry_save_dir.pack(side=tk.LEFT)
+        tk.Button(frame_save, text="浏览...", command=self.browse_save_dir).pack(side=tk.LEFT, padx=5)
+
         # 启动 / 导出按键
         frame_btns = tk.Frame(frame_config)
-        frame_btns.grid(row=2, column=0, columnspan=2, pady=10)
+        frame_btns.grid(row=3, column=0, columnspan=2, pady=10)
 
         self.btn_start = tk.Button(frame_btns, text="▶ 启动录制", command=self.toggle_recording, width=15, bg="green", fg="white", font=("", 10, "bold"))
         self.btn_start.pack(side=tk.LEFT, padx=5)
@@ -71,7 +80,7 @@ class MonitorApp:
 
         # 开源与作者声明
         frame_notice = tk.Frame(frame_config)
-        frame_notice.grid(row=3, column=0, columnspan=2, pady=(0, 5))
+        frame_notice.grid(row=4, column=0, columnspan=2, pady=(0, 5))
         
         lbl_notice = tk.Label(frame_notice, text="本项目基于 MIT 协议完全免费开源，项目地址：", fg="gray")
         lbl_notice.pack(side=tk.LEFT)
@@ -109,20 +118,52 @@ class MonitorApp:
                     if "max_gb" in data:
                         self.entry_max_gb.delete(0, tk.END)
                         self.entry_max_gb.insert(0, str(data["max_gb"]))
+                    if "save_dir" in data:
+                        self.entry_save_dir.delete(0, tk.END)
+                        self.entry_save_dir.insert(0, str(data["save_dir"]))
             except Exception as e:
                 self.log(f"读取配置失败: {e}")
+        self.refresh_save_dir()
 
     def save_config(self):
         """保存配置"""
         data = {
             "rtsp_url": self.entry_rtsp.get().strip(),
-            "max_gb": self.entry_max_gb.get().strip()
+            "max_gb": self.entry_max_gb.get().strip(),
+            "save_dir": self.entry_save_dir.get().strip()
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
         except Exception as e:
             self.log(f"保存配置失败: {e}")
+
+    def browse_save_dir(self):
+        """浏览选择保存目录"""
+        cur = self.entry_save_dir.get().strip() or str(BASE_DIR)
+        d = filedialog.askdirectory(initialdir=cur, title="选择录像保存目录")
+        if d:
+            self.entry_save_dir.delete(0, tk.END)
+            self.entry_save_dir.insert(0, d)
+            self.refresh_save_dir()
+
+    def refresh_save_dir(self):
+        """从输入框刷新 self.save_dir（仅主线程调用）。无效则回退到程序目录。"""
+        p = self.entry_save_dir.get().strip()
+        if not p:
+            self.save_dir = BASE_DIR
+            return
+        try:
+            path = Path(p)
+            path.mkdir(parents=True, exist_ok=True)
+            self.save_dir = path
+        except Exception as e:
+            self.log(f"保存目录不可用，回退到程序所在目录: {p} ({e})")
+            self.save_dir = BASE_DIR
+
+    def get_save_dir(self) -> Path:
+        """返回当前生效的保存根目录"""
+        return self.save_dir
 
     def toggle_recording(self):
         if self.is_recording:
@@ -143,11 +184,13 @@ class MonitorApp:
             return
 
         self.save_config()
+        self.refresh_save_dir()
         self.is_recording = True
         self.btn_start.config(text="■ 停止录制", bg="red")
         self.log(f"=== 开始录制服务 ===")
         self.log(f"流地址: {rtsp_url}")
         self.log(f"空间限制: {max_gb} GB")
+        self.log(f"保存目录: {self.get_save_dir()}")
         
         self.record_thread = threading.Thread(target=self.recording_task, args=(rtsp_url, max_gb), daemon=True)
         self.record_thread.start()
@@ -179,7 +222,8 @@ class MonitorApp:
 
     def _iter_occupied_files(self):
         """遍历所有计入配额占用的文件：日期目录下的 .ts 分片 + exports 目录下的导出 MP4"""
-        for d in BASE_DIR.iterdir():
+        save_root = self.get_save_dir()
+        for d in save_root.iterdir():
             try:
                 if d.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.name):
                     for f in d.glob("*.ts"):
@@ -187,7 +231,7 @@ class MonitorApp:
                             yield f
             except Exception:
                 continue
-        exports_dir = BASE_DIR / "exports"
+        exports_dir = save_root / "exports"
         if exports_dir.is_dir():
             try:
                 for f in exports_dir.glob("*.mp4"):
@@ -221,7 +265,7 @@ class MonitorApp:
         safe_cutoff = time.time() - DELETE_SAFE_SECONDS
         files = []
         # 只回收日期目录下的 .ts 分片，导出的 MP4 是用户主动产物，永不自动删除
-        for date_dir in BASE_DIR.iterdir():
+        for date_dir in self.get_save_dir().iterdir():
             try:
                 if not (date_dir.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_dir.name)):
                     continue
@@ -274,7 +318,7 @@ class MonitorApp:
 
     def get_exports_size_gb(self) -> float:
         """导出目录占用（GB）"""
-        exports_dir = BASE_DIR / "exports"
+        exports_dir = self.get_save_dir() / "exports"
         if not exports_dir.is_dir():
             return 0.0
         total_bytes = 0
@@ -291,7 +335,7 @@ class MonitorApp:
         """扫描所有录像日期目录（YYYY-MM-DD）"""
         dirs = []
         try:
-            for d in BASE_DIR.iterdir():
+            for d in self.get_save_dir().iterdir():
                 if d.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.name):
                     dirs.append(d.name)
         except Exception:
@@ -301,7 +345,7 @@ class MonitorApp:
     def _list_segments(self, date_str):
         """列出某天的所有分片，返回 [(Path, 'HH:MM:SS'), ...] 按时间升序"""
         segs = []
-        day_dir = BASE_DIR / date_str
+        day_dir = self.get_save_dir() / date_str
         try:
             for f in day_dir.glob("*.ts"):
                 m = re.fullmatch(r"(\d{2})_(\d{2})_(\d{2})\.ts", f.name)
@@ -331,9 +375,10 @@ class MonitorApp:
         if self.exporting:
             messagebox.showinfo("提示", "正在导出中，请等待当前导出完成")
             return
+        self.refresh_save_dir()
         date_dirs = self._list_date_dirs()
         if not date_dirs:
-            messagebox.showinfo("提示", "未找到任何录像日期目录")
+            messagebox.showinfo("提示", f"未找到任何录像日期目录（保存目录：{self.get_save_dir()}）")
             return
 
         dlg = tk.Toplevel(self.root)
@@ -374,7 +419,7 @@ class MonitorApp:
 
         def update_default_out(*_):
             entry_out.delete(0, tk.END)
-            entry_out.insert(0, str(BASE_DIR / "exports" / default_out_name()))
+            entry_out.insert(0, str(self.get_save_dir() / "exports" / default_out_name()))
 
         cb_date.bind("<<ComboboxSelected>>", refresh_times)
         cb_start.bind("<<ComboboxSelected>>", update_default_out)
@@ -457,6 +502,9 @@ class MonitorApp:
 
             vcodec, acodec = self._probe_stream_codecs(chosen[0])
             self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 导出探测: 视频={vcodec or '未知'}, 音频={acodec or '无'}")
+
+            # 确保输出目录存在（用户可能改了路径）
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
             list_file = BASE_DIR / f"_concat_{int(time.time() * 1000)}.txt"
             with open(list_file, "w", encoding="utf-8") as lf:
@@ -619,7 +667,7 @@ class MonitorApp:
                     break
 
                 today_str = datetime.now().strftime("%Y-%m-%d")
-                save_path = BASE_DIR / today_str
+                save_path = self.get_save_dir() / today_str
                 save_path.mkdir(exist_ok=True)
 
                 self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 录写入目录: {today_str}")
