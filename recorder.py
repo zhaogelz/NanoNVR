@@ -98,11 +98,18 @@ class MonitorApp:
         self.text_log.pack(fill=tk.BOTH, expand=True)
 
     def log(self, message):
-        """将日志输出到界面"""
+        """将日志输出到界面（超过 2000 行自动截断旧日志，防止长期运行内存膨胀）"""
         def append():
             self.text_log.config(state=tk.NORMAL)
             self.text_log.insert(tk.END, message + "\n")
             self.text_log.see(tk.END)
+            # 自动截断：保留最近 2000 行
+            try:
+                last_line = int(self.text_log.index("end-1c").split(".")[0])
+                if last_line > 2000:
+                    self.text_log.delete("1.0", f"{last_line - 2000}.0")
+            except Exception:
+                pass
             self.text_log.config(state=tk.DISABLED)
         self.root.after(0, append)
         print(message)
@@ -500,9 +507,18 @@ class MonitorApp:
         """后台线程：concat 拼接分片并转封装为 MP4（视频不重新编码）"""
         list_file = None
         try:
-            chosen = [f for f, t in self._list_segments(date_str) if start_t <= t <= end_t]
+            pairs = [(f, t) for f, t in self._list_segments(date_str) if start_t <= t <= end_t]
+            # 正在录制时，排除当前正在写入的分片，避免导出末尾出现半截 / 截断
+            if self.is_recording:
+                now = datetime.now()
+                cur_slot = f"{now.hour:02d}:{(now.minute // 15 * 15):02d}:00"
+                before = len(pairs)
+                pairs = [(f, t) for f, t in pairs if t != cur_slot]
+                if len(pairs) < before:
+                    self.log(f"[{now.strftime('%H:%M:%S')}] 已跳过正在写入的当前分片 {cur_slot.replace(':', '_')}_00.ts，导出末尾将停在该分片之前")
+            chosen = [f for f, _ in pairs]
             if not chosen:
-                raise RuntimeError("所选时间段内没有录像分片")
+                raise RuntimeError("所选时间段内没有可导出的完整分片（当前分片可能正在写入，请把结束分片往前选一格）")
 
             vcodec, acodec = self._probe_stream_codecs(chosen[0])
             self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 导出探测: 视频={vcodec or '未知'}, 音频={acodec or '无'}")
