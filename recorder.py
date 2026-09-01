@@ -4,6 +4,7 @@ import subprocess
 import time
 import threading
 import json
+import math
 import re
 import shutil
 import tempfile
@@ -96,6 +97,21 @@ def build_cleanup_plan(quota_gib, managed_gib, volume_total_gib, volume_free_gib
         quota_triggered=quota_triggered,
         volume_triggered=volume_triggered,
     )
+
+
+def validate_recording_quota(quota_gib, volume_total_gib):
+    """返回配额错误文案；合法时返回 None。"""
+    if not math.isfinite(quota_gib) or quota_gib <= 0:
+        return "录像配额必须是大于 0 的有限数字"
+
+    volume_floor_gib = max(MIN_VOLUME_FREE_GIB, volume_total_gib * MIN_VOLUME_FREE_RATIO)
+    safe_limit_gib = max(0.0, volume_total_gib - volume_floor_gib)
+    if quota_gib > safe_limit_gib:
+        return (
+            f"当前磁盘总容量约 {volume_total_gib:.2f} GiB，需要保留 {volume_floor_gib:.2f} GiB "
+            f"安全余量；录像配额最多可设为 {safe_limit_gib:.2f} GiB"
+        )
+    return None
 
 
 class RecordingProgressWatchdog:
@@ -458,18 +474,19 @@ class MonitorApp:
             self.refresh_save_dir()
 
     def refresh_save_dir(self):
-        """从输入框刷新 self.save_dir（仅主线程调用）。无效则回退到程序目录。"""
+        """从输入框刷新保存目录；显式路径不可用时返回 False，不静默改写系统盘。"""
         p = self.entry_save_dir.get().strip()
         if not p:
             self.save_dir = BASE_DIR
-            return
+            return True
         try:
             path = Path(p)
             path.mkdir(parents=True, exist_ok=True)
             self.save_dir = path
+            return True
         except Exception as e:
-            self.log(f"保存目录不可用，回退到程序所在目录: {p} ({e})")
-            self.save_dir = BASE_DIR
+            self.log(f"保存目录不可用，已阻止使用该路径: {p} ({e})")
+            return False
 
     def get_save_dir(self) -> Path:
         """返回当前生效的保存根目录"""
@@ -492,12 +509,26 @@ class MonitorApp:
         except ValueError:
             messagebox.showwarning("提示", "录像配额必须是有效数字")
             return
-        if max_gb <= 0:
-            messagebox.showwarning("提示", "录像配额必须大于 0")
+
+        if not self.refresh_save_dir():
+            messagebox.showerror("保存目录不可用", "请重新选择可写入的录像保存目录")
+            self._set_status("保存目录不可用，未启动", "red")
+            return
+
+        try:
+            volume_total_gib, _ = self._get_volume_usage_gib()
+        except Exception as exc:
+            messagebox.showerror("磁盘检查失败", f"无法读取保存目录所在磁盘的容量：{exc}")
+            self._set_status("磁盘容量检查失败，未启动", "red")
+            return
+
+        quota_error = validate_recording_quota(max_gb, volume_total_gib)
+        if quota_error:
+            messagebox.showwarning("录像配额不可用", quota_error)
+            self._set_status("录像配额不可用，未启动", "red")
             return
 
         self.save_config()
-        self.refresh_save_dir()
         self.is_recording = True
         self.btn_start.config(text="■ 停止录制", bg="red")
         self._set_status("正在启动 FFmpeg...", "#B26A00")

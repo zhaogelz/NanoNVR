@@ -15,6 +15,7 @@ from recorder import (
     StorageProtectionError,
     WindowsProcessJob,
     build_cleanup_plan,
+    validate_recording_quota,
 )
 
 
@@ -70,6 +71,26 @@ class CleanupPlanTests(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertAlmostEqual(plan.required_release_gib, 45.0)
         self.assertAlmostEqual(plan.target_managed_gib, 255.0)
+
+
+class RecordingQuotaValidationTests(unittest.TestCase):
+    def test_rejects_non_finite_and_non_positive_values(self):
+        for value in (float("nan"), float("inf"), float("-inf"), 0.0, -1.0):
+            with self.subTest(value=value):
+                self.assertIsNotNone(validate_recording_quota(value, 1000.0))
+
+    def test_reserves_larger_of_twenty_gib_or_five_percent(self):
+        self.assertIsNone(validate_recording_quota(950.0, 1000.0))
+        error = validate_recording_quota(950.01, 1000.0)
+
+        self.assertIsNotNone(error)
+        self.assertIn("最多可设为 950.00 GiB", error)
+
+    def test_small_volume_cannot_bypass_twenty_gib_floor(self):
+        error = validate_recording_quota(1.0, 10.0)
+
+        self.assertIsNotNone(error)
+        self.assertIn("最多可设为 0.00 GiB", error)
 
 
 class RecordingProgressWatchdogTests(unittest.TestCase):
@@ -245,6 +266,38 @@ class StorageCleanupTests(unittest.TestCase):
             self.assertFalse(worker.is_alive())
             self.assertTrue(candidate.exists())
             self.assertEqual(len(errors), 1)
+
+
+class SaveDirectoryValidationTests(unittest.TestCase):
+    class EntryStub:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    def test_explicit_unavailable_directory_does_not_fall_back(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            blocking_file = Path(temp_dir) / "not-a-directory"
+            blocking_file.write_text("x", encoding="utf-8")
+            original = Path(temp_dir) / "original"
+            app = MonitorApp.__new__(MonitorApp)
+            app.entry_save_dir = self.EntryStub(str(blocking_file / "child"))
+            app.save_dir = original
+            messages = []
+            app.log = messages.append
+
+            self.assertFalse(app.refresh_save_dir())
+            self.assertEqual(app.save_dir, original)
+            self.assertTrue(any("已阻止" in message for message in messages))
+
+    def test_empty_directory_setting_keeps_documented_program_default(self):
+        app = MonitorApp.__new__(MonitorApp)
+        app.entry_save_dir = self.EntryStub("")
+        app.save_dir = Path("unused")
+
+        self.assertTrue(app.refresh_save_dir())
+        self.assertEqual(app.save_dir, Path(__file__).parents[1])
 
 
 class LogSafetyTests(unittest.TestCase):
