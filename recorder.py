@@ -22,6 +22,7 @@ CLEAN_INTERVAL = 300
 POLL_INTERVAL = 10
 DELETE_SAFE_SECONDS = 120
 FFMPEG_TIMEOUT_US = "120000000"
+WRITE_STALL_TIMEOUT = 180
 HEALTHY_WATERMARK_RATIO = 0.90
 MIN_VOLUME_FREE_GIB = 20.0
 MIN_VOLUME_FREE_RATIO = 0.05
@@ -95,6 +96,28 @@ def build_cleanup_plan(quota_gib, managed_gib, volume_total_gib, volume_free_gib
         quota_triggered=quota_triggered,
         volume_triggered=volume_triggered,
     )
+
+
+class RecordingProgressWatchdog:
+    """只关心录像是否持续产生新字节，不把“进程存活”误当成“正在录像”。"""
+
+    def __init__(self, timeout_seconds=WRITE_STALL_TIMEOUT):
+        self.timeout_seconds = timeout_seconds
+        self.last_signature = None
+        self.last_progress_at = None
+
+    def start(self, now):
+        self.last_signature = None
+        self.last_progress_at = now
+
+    def observe(self, signature, now):
+        if self.last_progress_at is None:
+            self.start(now)
+        if signature is not None and signature != self.last_signature:
+            self.last_signature = signature
+            self.last_progress_at = now
+            return False
+        return now - self.last_progress_at >= self.timeout_seconds
 
 
 class ManagedFfmpegProcess:
@@ -335,9 +358,18 @@ class MonitorApp:
         self.btn_export = tk.Button(frame_btns, text="📤 导出录像", command=self.open_export_dialog, width=15, bg="#1976D2", fg="white", font=("", 10, "bold"))
         self.btn_export.pack(side=tk.LEFT, padx=5)
 
+        self.lbl_status = tk.Label(
+            frame_config,
+            text="状态：未开始",
+            fg="gray",
+            wraplength=580,
+            justify=tk.LEFT,
+        )
+        self.lbl_status.grid(row=5, column=0, columnspan=2, pady=(0, 5))
+
         # 开源与作者声明
         frame_notice = tk.Frame(frame_config)
-        frame_notice.grid(row=5, column=0, columnspan=2, pady=(0, 5))
+        frame_notice.grid(row=6, column=0, columnspan=2, pady=(0, 5))
         
         lbl_notice = tk.Label(frame_notice, text="本项目基于 MIT 协议完全免费开源，项目地址：", fg="gray")
         lbl_notice.pack(side=tk.LEFT)
@@ -369,6 +401,15 @@ class MonitorApp:
             self.text_log.config(state=tk.DISABLED)
         self.root.after(0, append)
         print(message)
+
+    def _set_status(self, text, color="gray"):
+        def apply():
+            if not self.closing:
+                self.lbl_status.config(text=f"状态：{text}", fg=color)
+        try:
+            self.root.after(0, apply)
+        except Exception:
+            pass
 
     @staticmethod
     def _redact_rtsp_url(value):
@@ -459,6 +500,7 @@ class MonitorApp:
         self.refresh_save_dir()
         self.is_recording = True
         self.btn_start.config(text="■ 停止录制", bg="red")
+        self._set_status("正在启动 FFmpeg...", "#B26A00")
         self.log(f"=== 开始录制服务 ===")
         self.log(f"流地址: {self._redact_rtsp_url(rtsp_url)}")
         self.log(f"录像配额: {max_gb:g} GiB（健康水位 {max_gb * HEALTHY_WATERMARK_RATIO:.2f} GiB）")
@@ -472,6 +514,7 @@ class MonitorApp:
             return
         self.is_recording = False
         self.btn_start.config(text="停止中...", state=tk.DISABLED, bg="gray")
+        self._set_status("正在停止...", "#B26A00")
         self.log("正在停止录制服务，请稍候...")
 
         # 启动一个后台线程等待真正停止
@@ -487,6 +530,7 @@ class MonitorApp:
     def _on_stopped(self):
         self.record_thread = None
         self.btn_start.config(text="▶ 启动录制", bg="green", state=tk.NORMAL)
+        self._set_status("已停止", "gray")
         self.log("=== 已停止录制服务 ===")
 
     def _stop_current_process(self):
@@ -580,13 +624,10 @@ class MonitorApp:
         # 按最后修改时间升序排列（最老的排前面），始终保护最新两个分片。
         files.sort(key=lambda x: x[1])
         protected_newest = {f.resolve() for f, _, _ in files[-PROTECTED_NEWEST_SEGMENTS:]}
-        with self._lease_lock:
-            leased_segments = set(self._leased_segments)
         files = [
             item for item in files
             if item[1] < safe_cutoff
             and item[0].resolve() not in protected_newest
-            and item[0].resolve() not in leased_segments
         ]
         
         deleted_bytes = 0
@@ -597,9 +638,13 @@ class MonitorApp:
             # 如果释放的空间达标，或者服务已停止，则停止删除
             if not self.is_recording or deleted_bytes >= target_release_bytes:
                 break
-                
+
             try:
-                os.remove(f)  # 直接删除并释放文件系统中的逻辑空间，不进入回收站
+                # 租约检查与删除必须在同一把锁内；否则导出可能刚登记租约就被旧快照删掉。
+                with self._lease_lock:
+                    if f.resolve() in self._leased_segments:
+                        continue
+                    os.remove(f)  # 直接删除并释放文件系统中的逻辑空间，不进入回收站
                 deleted_bytes += size
                 files_deleted_count += 1
                 
@@ -680,6 +725,35 @@ class MonitorApp:
             pass
         segs.sort(key=lambda x: x[1])
         return segs
+
+    def _select_and_lease_export_segments(self, date_str, start_t, end_t):
+        """在清理使用的同一把锁内完成选择和租约登记。"""
+        with self._lease_lock:
+            all_pairs = self._list_segments(date_str)
+            pairs = [(f, t) for f, t in all_pairs if start_t <= t <= end_t]
+            excluded_active = None
+            if self.is_recording and date_str == datetime.now().strftime("%Y-%m-%d") and all_pairs:
+                # 分片从 FFmpeg 实际启动时刻命名，不假设落在 00/15/30/45 整刻钟。
+                active_path = all_pairs[-1][0].resolve()
+                before = len(pairs)
+                pairs = [(f, t) for f, t in pairs if f.resolve() != active_path]
+                if len(pairs) < before:
+                    excluded_active = active_path
+
+            chosen = [f for f, _ in pairs]
+            if not chosen:
+                raise RuntimeError(
+                    "所选时间段内没有可导出的完整分片（最新分片可能仍在写入，请把结束分片往前选一格）"
+                )
+
+            leased = {f.resolve() for f in chosen}
+            self._leased_segments.update(leased)
+            return chosen, leased, excluded_active
+
+    def _release_segment_leases(self, leased):
+        if leased:
+            with self._lease_lock:
+                self._leased_segments.difference_update(leased)
 
     def _probe_stream_codecs(self, sample: Path):
         """用 ffmpeg -i 的输出探测视频/音频编码（无需 ffprobe）"""
@@ -822,23 +896,14 @@ class MonitorApp:
         list_file = None
         leased = set()
         try:
-            pairs = [(f, t) for f, t in self._list_segments(date_str) if start_t <= t <= end_t]
-            # 正在录制时，排除当前正在写入的分片，避免导出末尾出现半截 / 截断
-            if self.is_recording:
-                now = datetime.now()
-                cur_slot = f"{now.hour:02d}:{(now.minute // 15 * 15):02d}:00"
-                before = len(pairs)
-                pairs = [(f, t) for f, t in pairs if t != cur_slot]
-                if len(pairs) < before:
-                    self.log(f"[{now.strftime('%H:%M:%S')}] 已跳过正在写入的当前分片 {cur_slot.replace(':', '_')}_00.ts，导出末尾将停在该分片之前")
-            chosen = [f for f, _ in pairs]
-            if not chosen:
-                raise RuntimeError("所选时间段内没有可导出的完整分片（当前分片可能正在写入，请把结束分片往前选一格）")
-
-            # 导出进程会依次打开清单中的文件，整个导出期间都要阻止容量清理删除它们。
-            leased = {f.resolve() for f in chosen}
-            with self._lease_lock:
-                self._leased_segments.update(leased)
+            chosen, leased, excluded_active = self._select_and_lease_export_segments(
+                date_str, start_t, end_t
+            )
+            if excluded_active:
+                self.log(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] 已跳过仍可能写入的最新分片 "
+                    f"{excluded_active.name}，导出末尾将停在该分片之前"
+                )
 
             vcodec, acodec = self._probe_stream_codecs(chosen[0])
             self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 导出探测: 视频={vcodec or '未知'}, 音频={acodec or '无'}")
@@ -912,9 +977,7 @@ class MonitorApp:
             self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 导出失败: {e}")
             done_cb(str(e), None)
         finally:
-            if leased:
-                with self._lease_lock:
-                    self._leased_segments.difference_update(leased)
+            self._release_segment_leases(leased)
             if list_file:
                 try:
                     os.remove(list_file)
@@ -952,6 +1015,25 @@ class MonitorApp:
             output_template,
         ]
 
+    @staticmethod
+    def _latest_segment_signature(save_path):
+        latest = None
+        try:
+            for path in save_path.glob("*.ts"):
+                if not path.is_file():
+                    continue
+                stat = path.stat()
+                item = (stat.st_mtime_ns, path, stat.st_size)
+                if latest is None or item[0] > latest[0]:
+                    latest = item
+        except Exception:
+            return None, None
+
+        if latest is None:
+            return None, None
+        mtime_ns, path, size = latest
+        return path, (str(path.resolve()), size, mtime_ns)
+
     def _start_ffmpeg_with_timeout_fallback(self, rtsp_url, save_path: Path):
         timeout_candidates = ["-timeout", "-rw_timeout", "-stimeout"]
         for timeout_opt in timeout_candidates:
@@ -984,6 +1066,7 @@ class MonitorApp:
 
             if probe.poll() is None:
                 self.log(f"[{datetime.now().strftime('%H:%M:%S')}] ffmpeg 已启动")
+                self._set_status("FFmpeg 已启动，等待录像数据...", "#B26A00")
                 return probe, timeout_opt
 
             probe.stop()
@@ -1026,10 +1109,32 @@ class MonitorApp:
                 self._set_current_process(process)
                 current_day = today_str
                 last_clean_ts = time.time()
+                last_progress_check = 0.0
+                watchdog = RecordingProgressWatchdog()
+                watchdog.start(time.monotonic())
 
                 while self.is_recording and process.poll() is None:
                     time.sleep(1)
                     now_ts = time.time()
+                    monotonic_now = time.monotonic()
+
+                    if monotonic_now - last_progress_check >= POLL_INTERVAL:
+                        latest_path, signature = self._latest_segment_signature(save_path)
+                        if watchdog.observe(signature, monotonic_now):
+                            self.log(
+                                f"[{datetime.now().strftime('%H:%M:%S')}] 录像文件已连续 "
+                                f"{WRITE_STALL_TIMEOUT} 秒没有增长，主动重启 ffmpeg..."
+                            )
+                            self._set_status("录像无增长，正在重连...", "red")
+                            process.stop()
+                            break
+                        if latest_path and signature:
+                            latest_write = datetime.fromtimestamp(signature[2] / 1_000_000_000)
+                            self._set_status(
+                                f"录制中 · {latest_path.name} · 更新于 {latest_write.strftime('%H:%M:%S')}",
+                                "green",
+                            )
+                        last_progress_check = monotonic_now
 
                     if now_ts - last_clean_ts >= CLEAN_INTERVAL:
                         self.clean_old_files(max_gb)
@@ -1038,6 +1143,7 @@ class MonitorApp:
                     new_day = datetime.now().strftime("%Y-%m-%d")
                     if new_day != current_day:
                         self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 跨天切换录像目录...")
+                        self._set_status("跨天切换录像目录...", "#B26A00")
                         planned_rollover = True
                         break
 
@@ -1045,6 +1151,7 @@ class MonitorApp:
                 self._clear_current_process(process)
 
                 if self.is_recording and not planned_rollover:
+                    self._set_status("等待重连...", "#B26A00")
                     err_tail = process.recent_errors()
                     if err_tail.strip():
                         self.log(
@@ -1057,6 +1164,7 @@ class MonitorApp:
                     process.stop()
                     self._clear_current_process(process)
                 self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 发生异常: {e}")
+                self._set_status(f"已停止：{e}", "red")
                 # 抛出窗口级错误提示（切回主UI线程显示）
                 self.root.after(0, lambda err=str(e): messagebox.showerror("录制错误", err))
                 # 自动停止录制并复位按钮
@@ -1065,6 +1173,7 @@ class MonitorApp:
 
             if self.is_recording and not planned_rollover:
                 self.log(f"[{datetime.now().strftime('%H:%M:%S')}] 将在 {RETRY_INTERVAL} 秒后尝试重连...")
+                self._set_status(f"{RETRY_INTERVAL} 秒后重连...", "#B26A00")
                 # 将阻塞睡眠分散，以便更快响应停止操作
                 for _ in range(RETRY_INTERVAL):
                     if not self.is_recording:

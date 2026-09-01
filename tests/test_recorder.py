@@ -5,11 +5,13 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from recorder import (
     ManagedFfmpegProcess,
     MonitorApp,
+    RecordingProgressWatchdog,
     StorageProtectionError,
     WindowsProcessJob,
     build_cleanup_plan,
@@ -68,6 +70,24 @@ class CleanupPlanTests(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertAlmostEqual(plan.required_release_gib, 45.0)
         self.assertAlmostEqual(plan.target_managed_gib, 255.0)
+
+
+class RecordingProgressWatchdogTests(unittest.TestCase):
+    def test_stalls_when_no_file_appears_before_timeout(self):
+        watchdog = RecordingProgressWatchdog(timeout_seconds=180)
+        watchdog.start(100.0)
+
+        self.assertFalse(watchdog.observe(None, 279.9))
+        self.assertTrue(watchdog.observe(None, 280.0))
+
+    def test_new_file_growth_resets_timeout(self):
+        watchdog = RecordingProgressWatchdog(timeout_seconds=180)
+        watchdog.start(100.0)
+
+        self.assertFalse(watchdog.observe(("a.ts", 100, 1), 200.0))
+        self.assertFalse(watchdog.observe(("a.ts", 200, 2), 370.0))
+        self.assertFalse(watchdog.observe(("a.ts", 200, 2), 549.9))
+        self.assertTrue(watchdog.observe(("a.ts", 200, 2), 550.0))
 
 
 class ManagedFfmpegProcessTests(unittest.TestCase):
@@ -168,6 +188,63 @@ class StorageCleanupTests(unittest.TestCase):
 
             with self.assertRaises(StorageProtectionError):
                 app.clean_old_files(0.0001)
+
+    def test_export_excludes_actual_latest_filename_and_leases_the_rest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            day = Path(temp_dir) / date_str
+            day.mkdir()
+            complete = day / "17_41_13.ts"
+            active = day / "17_56_13.ts"
+            self._write_segment(complete, 10_000, 20)
+            self._write_segment(active, 10_000, 10)
+            app = self._make_app(temp_dir)
+
+            chosen, leased, excluded = app._select_and_lease_export_segments(
+                date_str, "00:00:00", "23:59:59"
+            )
+
+            self.assertEqual(chosen, [complete])
+            self.assertEqual(excluded, active.resolve())
+            self.assertIn(complete.resolve(), app._leased_segments)
+            app._release_segment_leases(leased)
+            self.assertNotIn(complete.resolve(), app._leased_segments)
+
+    def test_cleanup_rechecks_lease_atomically_before_delete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            day = Path(temp_dir) / "2026-09-01"
+            day.mkdir()
+            candidate = day / "00_00_00.ts"
+            newest_one = day / "00_15_00.ts"
+            newest_two = day / "00_30_00.ts"
+            self._write_segment(candidate, 100_000, 1000)
+            self._write_segment(newest_one, 10_000, 900)
+            self._write_segment(newest_two, 10_000, 800)
+            app = self._make_app(temp_dir)
+            cleanup_started = threading.Event()
+            errors = []
+
+            def log(message):
+                if "开始批量删除" in message:
+                    cleanup_started.set()
+
+            def run_cleanup():
+                try:
+                    app.clean_old_files(0.00005)
+                except StorageProtectionError as exc:
+                    errors.append(exc)
+
+            app.log = log
+            with app._lease_lock:
+                worker = threading.Thread(target=run_cleanup)
+                worker.start()
+                self.assertTrue(cleanup_started.wait(timeout=2))
+                app._leased_segments.add(candidate.resolve())
+            worker.join(timeout=2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(candidate.exists())
+            self.assertEqual(len(errors), 1)
 
 
 class LogSafetyTests(unittest.TestCase):
