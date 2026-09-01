@@ -313,7 +313,7 @@ class WindowsProcessJob:
 class MonitorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("NanoNVR - 护盘型循环录像机")
+        self.root.title("NanoNVR | 更爱惜硬盘的监控录像机")
         self.root.geometry("640x480")
         self.root.minsize(540, 440)
         
@@ -352,7 +352,7 @@ class MonitorApp:
 
         tk.Label(
             frame_config,
-            text="护盘循环：连续切片写入，达到配额后成批回收到 90%",
+            text="空间保护：达到配额后成批回收到 90%，并保留磁盘余量",
             fg="gray",
         ).grid(row=2, column=1, sticky=tk.W, padx=5)
 
