@@ -1,0 +1,27 @@
+schema_version = 2
+mode = "managed"
+slots = 3
+branch_prefix = "codex/"
+worktree_directory = ".worktrees" # repository-relative only
+port_base = 20000
+remote_policy = "local-only"
+sensitive_allowlist = []
+agents_file_created = true
+
+# Optional repository-declared scanner, for example: ["gitleaks", "protect", "--staged"]
+# secret_scanner = []
+# Optional serial preparation commands for an idle slot. No environment is copied.
+# warm = [["uv", "sync"]]
+
+# Only exact top-level paths explicitly declared here may be removed by prune-slot.
+# An empty list means no dependencies or caches are ever removed automatically.
+cleanup = { owned_paths = [] }
+# 默认每满 5 个候选自动封批；不足 5 个只由协调任务显式收尾。
+integration = { mode = "batched", batch_size = 5, candidate_capacity = 10, seal_policy = "auto_full" }
+
+[lifecycle]
+# dev_start = ["npm", "run", "dev", "--", "--port", "{port}"]
+# [lifecycle.readiness]
+# kind = "http" # tcp or http
+# target = "http://127.0.0.1:{port}/health"
+# timeout_seconds = 30

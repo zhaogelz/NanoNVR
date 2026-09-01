@@ -1,0 +1,6 @@
+<!-- develop-with-worktrees:managed:start -->
+## Isolated coding tasks
+
+For every task that may modify repository files, use the installed `develop-with-worktrees` skill before editing. Run `start`, work only in the returned worktree, stage an exact reviewed path list with `commit`, then run `ready` and `finish`. Read-only analysis does not claim a slot. Do not bypass a failed gate. The DWW lifecycle is local-only and must not fetch, pull, push, create PRs, rebase, squash, amend, or rewrite history. After a successful Finish, an explicit user request may be fulfilled with an ordinary non-force push of the current branch from the clean base worktree; that publishing step is separate from DWW.
+`Start` creates the local task anchor; keep it current and reread it after continuation or context loss. New repositories publish verified candidates, release the task worktree, and automatically freeze each full configured batch. The current coordinating task explicitly seals an exact smaller tail after it knows the intended work is complete. Never infer a tail from idle time, active-task counts, Hook delivery, or session end. Use the host's native task/subagent system for task orchestration; legacy `dww orchestrate` state is drain-only. Explicit legacy direct policy remains upgrade compatibility only.
+<!-- develop-with-worktrees:managed:end -->
